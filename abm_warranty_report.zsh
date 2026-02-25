@@ -4,6 +4,12 @@
 # Script Name:  abm_warranty_report.zsh
 # Author:       Brandon Woods
 # Date:         February 23, 2026
+#
+# Changelog:
+#   February 25, 2026 — Added AppleCare+ support. Warranty Expires now reflects
+#                       the AppleCare+ expiration date when active coverage exists,
+#                       falling back to the Limited Warranty date for devices
+#                       without AppleCare. Credit: fpatafta (Jamf Nation Community)
 # ==============================================================================
 #
 # Pulls device and AppleCare / warranty coverage data from Apple Business
@@ -317,11 +323,20 @@ while true; do
             continue
         fi
 
-        # Limited Warranty end date -> Warranty Expires (date only)
+        # Warranty Expires — prefer active AppleCare+ expiration date when available,
+        # fall back to Limited Warranty end date if no active AppleCare coverage exists.
+        # Credit: fpatafta (Jamf Nation Community, February 25, 2026)
         warrantyExpires=$(echo "$coverageResponse" | jq -r '
-            [ .data[] | select(.attributes.description == "Limited Warranty") ]
+            [ .data[] | select(.attributes.description != "Limited Warranty" and .attributes.status == "ACTIVE") ]
             | first
             | .attributes.endDateTime // ""')
+
+        if [[ -z "$warrantyExpires" || "$warrantyExpires" == "null" ]]; then
+            warrantyExpires=$(echo "$coverageResponse" | jq -r '
+                [ .data[] | select(.attributes.description == "Limited Warranty") ]
+                | first
+                | .attributes.endDateTime // ""')
+        fi
         warrantyExpires="${warrantyExpires%%T*}"
 
         # AppleCare agreement number -> AppleCare ID (prefer ACTIVE entry)
