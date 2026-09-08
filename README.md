@@ -104,15 +104,18 @@ Find the configuration block near the top of the script:
 
 ```zsh
 # ---------- Configuration (edit these) ---------------------------------------
-ABM_PRIVATE_KEY_PATH=&quot;/path/to/private-key.pem&quot;
-ABM_CLIENT_ID=&quot;BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&quot;
-ABM_KEY_ID=&quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&quot;
-OUTPUT_DIR=&quot;.&quot;
-COMPUTER_FILENAME=&quot;ComputerTemplate.csv&quot;
-MOBILE_FILENAME=&quot;MobileDeviceTemplate.csv&quot;
+ABM_PRIVATE_KEY_PATH="/path/to/private-key.pem"
+ABM_CLIENT_ID="BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+ABM_KEY_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+OUTPUT_DIR="."
+COMPUTER_FILENAME="ComputerTemplate.csv"
+MOBILE_FILENAME="MobileDeviceTemplate.csv"
+FAILED_FILENAME="failed_coverage.csv"
 ASM_MODE=false
 RATE_LIMIT_DELAY=0.3
 PAGE_FETCH_DELAY=2
+CURL_CONNECT_TIMEOUT=15
+CURL_MAX_TIME=60
 ```
 
 Replace each placeholder with your actual values:
@@ -128,6 +131,9 @@ Replace each placeholder with your actual values:
 | `ASM_MODE` | Set to `true` if using Apple School Manager, leave as `false` for Apple Business Manager |
 | `RATE_LIMIT_DELAY` | Pause in seconds between per-device coverage API calls (default: `0.3`) |
 | `PAGE_FETCH_DELAY` | Pause in seconds between page-level device list fetches (default: `2`) |
+| `FAILED_FILENAME` | Name of the file listing devices whose coverage lookup failed (default: `failed_coverage.csv`) |
+| `CURL_CONNECT_TIMEOUT` | Seconds to wait for a connection before giving up (default: `15`) |
+| `CURL_MAX_TIME` | Maximum seconds for any single request (default: `60`) |
 
 Save and close the file when done.
 
@@ -220,6 +226,19 @@ The **Warranty Expires** field prioritizes the AppleCare+ expiration date when a
 
 > **Note:** If you previously ran the script before AppleCare+ support was added, existing devices in your CSVs will still have the old Limited Warranty dates. To re-fetch corrected dates for those devices, delete or rename your existing CSV files and run the script again so all devices are treated as new.
 
+### Coverage failures are retried, not silently recorded
+
+If a device's coverage lookup fails, the script does **not** write a partial row. Writing one would put the serial into the CSV with a blank Warranty Expires, and incremental mode would then treat that device as already done and skip it on every future run — turning a momentary API hiccup into permanently missing warranty data. Instead the serial, product family, and HTTP status are appended to `failed_coverage.csv`, and the device is retried automatically on the next run.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Run completed; every device encountered was either written or already present |
+| `1` | Setup/auth error, **or** the run finished with one or more devices in `failed_coverage.csv` |
+
+A non-zero exit on a partial run makes the script safe to schedule with launchd, a Jamf policy, or CI — a run that skipped devices no longer reports success.
+
 ### Incremental updates
 
 The script is designed to be run repeatedly as new devices are added to ABM or ASM. When run again:
@@ -239,7 +258,8 @@ The Apple API enforces rate limits on requests. The script handles this in sever
 - **Per-device throttling** — a configurable delay (`RATE_LIMIT_DELAY`, default 0.3 seconds) is applied between each individual device coverage API call.
 - **Automatic retries** — both page fetches and per-device coverage calls will retry up to 3 times on HTTP 429 (rate limited) responses, with increasing back-off. The `Retry-After` header is honored when the server provides one.
 - **Early exit** — on incremental runs, if the number of known serials already matches the total device count reported by the API, the script exits immediately without fetching any pages.
-- **Token expiry detection** — the bearer token is valid for approximately 1 hour. The script warns at ~50 minutes of runtime and exits at ~58 minutes to prevent silent authentication failures on very large organizations.
+- **Automatic token refresh** — the bearer token is valid for approximately 1 hour. Once it reaches ~50 minutes the script mints a fresh one and carries on, so a run is never cut short by token expiry. Expiry is checked both between pages and before each individual coverage call, since a single page can take long enough to outlive the token on its own.
+- **Request timeouts** — every API call is bounded by `CURL_CONNECT_TIMEOUT` and `CURL_MAX_TIME`, so a stalled connection cannot hang the run indefinitely.
 
 ---
 
@@ -279,8 +299,8 @@ If you want to use different filenames for the generated CSVs — for example, t
 
 ```zsh
 ./warranty_wrangler.zsh \
-  --computer-file &quot;Macs_$(date +%Y-%m-%d).csv&quot; \
-  --mobile-file &quot;Mobile_$(date +%Y-%m-%d).csv&quot;
+  --computer-file "Macs_$(date +%Y-%m-%d).csv" \
+  --mobile-file "Mobile_$(date +%Y-%m-%d).csv"
 ```
 
 You can also change `COMPUTER_FILENAME` and `MOBILE_FILENAME` directly in the configuration block at the top of the script.
@@ -299,7 +319,9 @@ You can also change `COMPUTER_FILENAME` and `MOBILE_FILENAME` directly in the co
 
 **Frequent HTTP 429 (rate limited) errors** — increase the delay between requests by passing `--page-delay 4` and/or `--delay 0.5`. The default values (`PAGE_FETCH_DELAY=2`, `RATE_LIMIT_DELAY=0.3`) work well for most environments, but organizations with very large device counts or shared API rate limits may need higher values.
 
-**"Bearer token is about to expire"** — the bearer token is valid for approximately 1 hour. If your organization has enough devices that the script runs longer than ~58 minutes, it will exit to prevent auth failures. Simply re-run the script — incremental mode will pick up where it left off, skipping devices already in the CSV.
+**Run takes longer than an hour** — this is handled automatically. The bearer token is valid for about 1 hour, and the script refreshes it in place once it reaches ~50 minutes, so long runs complete in a single pass. Earlier versions exited at ~58 minutes and had to be re-run.
+
+**Devices listed in `failed_coverage.csv`** — these are devices whose AppleCare coverage lookup did not return successfully (a timeout, a 5xx, or an auth failure). They are deliberately **not** written to the CSVs, because a row with a blank Warranty Expires would be treated as complete by incremental mode and skipped on every later run. Simply run the script again — because they are absent from the CSVs, they are picked up and retried. The file is rewritten only on a run that has failures, so a leftover file from an earlier run is reported as stale in the summary.
 
 **Warranty fields are blank in Jamf after MUT import** — confirm that the column headers in the CSV match the field names in Jamf Pro exactly. The script uses MUT's default column names, so no changes should be needed on a standard Jamf setup.
 
